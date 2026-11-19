@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+from html import unescape
 import sys
 import time
 import uuid
@@ -38,10 +39,8 @@ log = logging.getLogger("firststep")
 # Config
 # --------------------------------------------------------------------------- #
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
+    # Identify honestly. Set CONTACT_EMAIL in .env / GitHub secrets (optional).
+    "User-Agent": f"FirststepBot/1.0 (job aggregator; contact: {os.environ.get('CONTACT_EMAIL', 'see github.com/DivyaKandhasamy/firststep')})",
     "Accept-Language": "en-IN,en;q=0.9",
 }
 RATE_LIMIT_SECONDS = 2          # polite delay between every HTTP request
@@ -142,91 +141,27 @@ def parse_date(value) -> datetime | None:
 
 
 # --------------------------------------------------------------------------- #
-# Source 1: Internshala (HTML)
-# NOTE: selectors reflect Internshala's markup at time of writing. If the site
-# changes, update SELECTORS only; everything else is source-agnostic.
-# --------------------------------------------------------------------------- #
-INTERNSHALA_BASE = "https://internshala.com"
-INTERNSHALA_PAGES = [
-    # (listing url, job type hint)
-    (f"{INTERNSHALA_BASE}/internships/computer-science-internship", "Internship"),
-    (f"{INTERNSHALA_BASE}/internships/web-development-internship", "Internship"),
-    (f"{INTERNSHALA_BASE}/internships/data-science-internship", "Internship"),
-    (f"{INTERNSHALA_BASE}/fresher-jobs/computer-science-jobs", "Full-Time"),
-    (f"{INTERNSHALA_BASE}/fresher-jobs/software-development-jobs", "Full-Time"),
-]
-SELECTORS = {
-    "card": "div.individual_internship, div.internship_meta",
-    "title": ".job-internship-name, .profile, h3.job-internship-name a, a.job-title-href",
-    "company": ".company-name, .company_name a, p.company-name",
-    "location": ".locations span, .location_link, #location_names span",
-    "link": "a.job-title-href, a[href*='/internship/detail/'], a[href*='/job/detail/']",
-    "detail_description": ".internship_details, .text-container, .about_company_text_container",
-}
-
-
-def scrape_internshala() -> Iterable[RawJob]:
-    seen: set[str] = set()
-    for listing_url, hint in INTERNSHALA_PAGES:
-        html = fetch(listing_url)
-        if not html:
-            continue
-        soup = BeautifulSoup(html, "html.parser")
-        for card in soup.select(SELECTORS["card"]):
-            link_el = card.select_one(SELECTORS["link"])
-            href = link_el.get("href") if link_el else card.get("data-href")
-            if not href:
-                continue
-            url = urljoin(INTERNSHALA_BASE, href).split("?")[0]
-            if url in seen:
-                continue
-            seen.add(url)
-
-            title_el = card.select_one(SELECTORS["title"])
-            company_el = card.select_one(SELECTORS["company"])
-            if not title_el or not company_el:
-                continue
-            location = ", ".join(
-                clean(el.get_text()) for el in card.select(SELECTORS["location"])
-            )
-            snippet = clean(card.get_text(" "))
-            description = snippet
-            # Detail page gives the AI far better context than the card snippet.
-            detail_html = fetch(url)
-            if detail_html:
-                detail = BeautifulSoup(detail_html, "html.parser")
-                body = " ".join(
-                    clean(el.get_text(" ")) for el in detail.select(SELECTORS["detail_description"])
-                )
-                if body:
-                    description = body
-            yield RawJob(
-                source_url=url,
-                title=clean(title_el.get_text()),
-                company=clean(company_el.get_text()),
-                description=description[:DESCRIPTION_CHAR_LIMIT],
-                portal="Internshala",
-                hint_type=hint,
-                hint_location=location or None,
-                posted_at=parse_relative_age(snippet),
-            )
-
-
-# --------------------------------------------------------------------------- #
 # Source 2: Unstop (public JSON search endpoint used by its own site)
 # Unofficial / undocumented: may change or be rate-limited. Fails soft.
 # --------------------------------------------------------------------------- #
 UNSTOP_API = "https://unstop.com/api/public/opportunity/search-result"
 
 
+UNSTOP_PAGES = int(os.environ.get("UNSTOP_PAGES", "5"))   # pages of 30 per opportunity type
+UNSTOP_PER_PAGE = 30
+
+
 def scrape_unstop() -> Iterable[RawJob]:
     for opp, hint in (("internships", "Internship"), ("jobs", "Full-Time")):
+      for page in range(1, UNSTOP_PAGES + 1):
         data = fetch(
             UNSTOP_API,
-            params={"opportunity": opp, "per_page": 30, "oppstatus": "open", "page": 1},
+            params={"opportunity": opp, "per_page": UNSTOP_PER_PAGE, "oppstatus": "open", "page": page},
             as_json=True,
         )
         items = ((data or {}).get("data") or {}).get("data") or []
+        if not items:
+            break
         for item in items:
             slug = item.get("public_url") or item.get("seo_url")
             title = clean(item.get("title"))
@@ -257,38 +192,107 @@ def scrape_unstop() -> Iterable[RawJob]:
 
 
 # --------------------------------------------------------------------------- #
-# Source 3: Remotive (documented public API, remote roles; India-friendly filter)
+# Sources 3-5: company job boards on Greenhouse, Lever and Ashby.
+# These platforms publish each company's open roles as public JSON on purpose
+# (no login, no key). We keep only India locations with entry-level titles.
+# A company slug that does not exist just returns 404 and is skipped.
+# Edit the lists below, or override with env vars (comma-separated).
 # --------------------------------------------------------------------------- #
-REMOTIVE_API = "https://remotive.com/api/remote-jobs"
-ENTRY_LEVEL = re.compile(r"\b(intern|internship|trainee|fresher|graduate|junior|entry[- ]level|associate)\b", re.I)
+def _slugs(env: str, default: str) -> list[str]:
+    return [x.strip() for x in os.environ.get(env, default).split(",") if x.strip()]
 
 
-def scrape_remotive() -> Iterable[RawJob]:
-    data = fetch(REMOTIVE_API, params={"category": "software-dev", "limit": 100}, as_json=True)
-    for item in (data or {}).get("jobs", []):
-        title = clean(item.get("title"))
-        if not ENTRY_LEVEL.search(title):
-            continue
-        region = clean(item.get("candidate_required_location"))
-        if region and not re.search(r"worldwide|anywhere|india|apac|asia", region, re.I):
-            continue
-        description = clean(BeautifulSoup(item.get("description") or "", "html.parser").get_text(" "))
-        yield RawJob(
-            source_url=item.get("url", ""),
-            title=title,
-            company=clean(item.get("company_name")),
-            description=description[:DESCRIPTION_CHAR_LIMIT],
-            portal="Remotive",
-            hint_type="Internship" if re.search(r"intern", title, re.I) else None,
-            hint_location="Remote",
-            posted_at=parse_date(item.get("publication_date")),
-        )
+GREENHOUSE_BOARDS = _slugs("GREENHOUSE_BOARDS",
+    "razorpay,postman,browserstack,druva,thoughtspot,icertis,stripe,databricks,mongodb,cloudflare,"
+    "elastic,twilio,coinbase,gitlab,okta,samsara,airbnb,pinterest,figma,datadog")
+LEVER_BOARDS = _slugs("LEVER_BOARDS", "cred,meesho,palantir,spotify,paytm,upgrad,dunzo,zeta,jupiter,slice")
+ASHBY_BOARDS = _slugs("ASHBY_BOARDS", "ramp,notion,openai,linear,deel,rippling,sarvam,zepto,groww,leapfinance")
+
+ENTRY_LEVEL = re.compile(
+    r"\b(intern|internship|trainee|fresher|graduate|new[- ]grad|apprentice|junior|entry[- ]level|"
+    r"sde[- ]?1|sde[- ]?i|engineer[- ]i|analyst[- ]i|associate)\b", re.I)
+SENIOR = re.compile(r"\b(senior|sr\.?|staff|principal|lead|manager|director|head|vp|architect|ii|iii|iv)\b", re.I)
+INDIA = re.compile(
+    r"\b(india|bengaluru|bangalore|mumbai|delhi|new delhi|gurugram|gurgaon|noida|hyderabad|pune|"
+    r"chennai|kolkata|ahmedabad|jaipur|kochi|coimbatore|indore|chandigarh)\b", re.I)
+
+
+def _entry_level_india(title: str, location: str) -> bool:
+    return bool(ENTRY_LEVEL.search(title) and not SENIOR.search(title) and INDIA.search(location or ""))
+
+
+def _plain(html: str | None) -> str:
+    return clean(BeautifulSoup(unescape(html or ""), "html.parser").get_text(" "))
+
+
+def _company_name(slug: str) -> str:
+    return slug.replace("-", " ").title()
+
+
+def scrape_greenhouse() -> Iterable[RawJob]:
+    for slug in GREENHOUSE_BOARDS:
+        data = fetch(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs", params={"content": "true"}, as_json=True)
+        kept = 0
+        for j in (data or {}).get("jobs", []):
+            title, loc = clean(j.get("title")), clean((j.get("location") or {}).get("name"))
+            if not _entry_level_india(title, loc):
+                continue
+            kept += 1
+            yield RawJob(
+                source_url=j.get("absolute_url", ""), title=title, company=clean(j.get("company_name")) or _company_name(slug),
+                description=_plain(j.get("content"))[:DESCRIPTION_CHAR_LIMIT], portal="Greenhouse",
+                hint_type="Internship" if re.search(r"intern", title, re.I) else None,
+                hint_location=loc or None,
+                posted_at=parse_date(j.get("first_published") or j.get("updated_at")),
+            )
+        log.info("greenhouse/%s: %d entry-level India roles", slug, kept)
+
+
+def scrape_lever() -> Iterable[RawJob]:
+    for slug in LEVER_BOARDS:
+        data = fetch(f"https://api.lever.co/v0/postings/{slug}", params={"mode": "json"}, as_json=True)
+        kept = 0
+        for j in data if isinstance(data, list) else []:
+            cats = j.get("categories") or {}
+            title, loc = clean(j.get("text")), clean(cats.get("location"))
+            if not _entry_level_india(title, loc):
+                continue
+            kept += 1
+            created = j.get("createdAt")
+            yield RawJob(
+                source_url=j.get("hostedUrl", ""), title=title, company=_company_name(slug),
+                description=clean(j.get("descriptionPlain"))[:DESCRIPTION_CHAR_LIMIT], portal="Lever",
+                hint_type="Internship" if re.search(r"intern", f"{title} {cats.get('commitment', '')}", re.I) else None,
+                hint_location=loc or None,
+                posted_at=parse_date(created / 1000 if isinstance(created, (int, float)) else None),
+            )
+        log.info("lever/%s: %d entry-level India roles", slug, kept)
+
+
+def scrape_ashby() -> Iterable[RawJob]:
+    for slug in ASHBY_BOARDS:
+        data = fetch(f"https://api.ashbyhq.com/posting-api/job-board/{slug}", as_json=True)
+        kept = 0
+        for j in (data or {}).get("jobs", []):
+            title, loc = clean(j.get("title")), clean(j.get("location"))
+            if not _entry_level_india(title, loc):
+                continue
+            kept += 1
+            yield RawJob(
+                source_url=j.get("jobUrl", ""), title=title, company=_company_name(slug),
+                description=clean(j.get("descriptionPlain"))[:DESCRIPTION_CHAR_LIMIT], portal="Ashby",
+                hint_type="Internship" if re.search(r"intern", f"{title} {j.get('employmentType', '')}", re.I) else None,
+                hint_location=loc or None,
+                posted_at=parse_date(j.get("publishedAt")),
+            )
+        log.info("ashby/%s: %d entry-level India roles", slug, kept)
 
 
 SOURCES: dict[str, Callable[[], Iterable[RawJob]]] = {
-    "Internshala": scrape_internshala,
     "Unstop": scrape_unstop,
-    "Remotive": scrape_remotive,
+    "Greenhouse": scrape_greenhouse,
+    "Lever": scrape_lever,
+    "Ashby": scrape_ashby,
 }
 
 
@@ -521,8 +525,10 @@ def _call_model(client, model: str, prompt: str) -> str:
 
     extra = {}
     if "2.5" in model and "pro" not in model:
+        # 2.5 Flash "thinks" by default and thinking tokens are billed as output. Tagging is a simple
+        # extraction task, so switch thinking off (measured: ~3,400 thinking tokens/request vs ~700 output).
         extra["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1, **extra)  
+    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1, **extra)
     for attempt in range(len(SERVER_RETRY_WAITS) + 1):
         USAGE.requests += 1
         try:
@@ -702,7 +708,7 @@ def run(dry_run: bool, only: list[str] | None) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="don't write to Supabase")
-    parser.add_argument("--only", help="comma-separated sources, e.g. internshala,unstop")
+    parser.add_argument("--only", help="comma-separated sources, e.g. unstop,greenhouse,lever,ashby")
     parser.add_argument("--backfill-dedupe", action="store_true", help="flag cross-portal duplicates among existing rows, then exit")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
