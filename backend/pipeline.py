@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable
@@ -340,6 +341,136 @@ def purge_old(sb) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Token / request accounting (feeds the cost-per-1,000-posts number)
+# --------------------------------------------------------------------------- #
+@dataclass
+class Usage:
+    requests: int = 0            # every HTTP attempt, including failed ones (they can count against quota)
+    failed_requests: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0       # candidates only
+    thinking_tokens: int = 0     # billed as output by Gemini; tracked separately
+    by_model: dict = field(default_factory=dict)
+
+
+USAGE = Usage()
+
+
+def record_usage(model: str, resp) -> None:
+    meta = getattr(resp, "usage_metadata", None)
+    tin = int(getattr(meta, "prompt_token_count", 0) or 0)
+    tout = int(getattr(meta, "candidates_token_count", 0) or 0)
+    tthink = int(getattr(meta, "thoughts_token_count", 0) or 0)
+    USAGE.input_tokens += tin
+    USAGE.output_tokens += tout
+    USAGE.thinking_tokens += tthink
+    m = USAGE.by_model.setdefault(model, {"requests": 0, "input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0})
+    m["requests"] += 1
+    m["input_tokens"] += tin
+    m["output_tokens"] += tout
+    m["thinking_tokens"] += tthink
+
+
+# --------------------------------------------------------------------------- #
+# Cross-portal de-duplication
+# The URL check (existing_urls) catches the same listing twice. This catches the SAME JOB under
+# different URLs/portals: key = normalised company | normalised role | normalised city.
+# Duplicates are STORED but flagged (duplicate_of -> canonical id) and hidden by the frontend, so the
+# URL check still skips them next run and we never pay to re-tag them.
+# --------------------------------------------------------------------------- #
+_LEGAL_SUFFIX = re.compile(
+    r"\b(pvt|private|ltd|limited|llp|llc|inc|corp|corporation|co|technologies|technology|solutions)\b"
+)
+
+
+def _norm(text: str | None) -> str:
+    t = re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def norm_company(name: str | None) -> str:
+    t = re.sub(r"\s+", " ", _LEGAL_SUFFIX.sub(" ", _norm(name))).strip()
+    return t or _norm(name)
+
+
+def make_dedupe_key(company: str | None, role: str | None, city: str | None) -> str:
+    return f"{norm_company(company)}|{_norm(role)}|{_norm(city)}"
+
+
+def existing_dedupe_keys(sb, keys: list[str]) -> dict[str, str]:
+    """{dedupe_key: canonical job id} for keys already stored as canonical (not duplicates)."""
+    found: dict[str, str] = {}
+    for i in range(0, len(keys), 50):
+        chunk = keys[i : i + 50]
+        rows = (
+            sb.table("jobs").select("id,dedupe_key").in_("dedupe_key", chunk).is_("duplicate_of", "null").execute().data
+        )
+        found.update({r["dedupe_key"]: r["id"] for r in rows})
+    return found
+
+
+def assign_dedupe(sb, rows: list[dict], seen: dict[str, str]) -> int:
+    """Give every row an id + dedupe_key + duplicate_of. `seen` carries canonical keys across batches.
+    Returns how many rows in this batch were duplicates."""
+    for row in rows:
+        row["id"] = str(uuid.uuid4())
+        row["dedupe_key"] = make_dedupe_key(row["company_name"], row["ai_role"], row["ai_city"])
+    if sb is not None:
+        unknown = sorted({r["dedupe_key"] for r in rows} - seen.keys())
+        if unknown:
+            seen.update(existing_dedupe_keys(sb, unknown))
+    dups = 0
+    for row in rows:
+        canonical = seen.get(row["dedupe_key"])
+        if canonical:
+            row["duplicate_of"] = canonical
+            dups += 1
+        else:
+            row["duplicate_of"] = None
+            seen[row["dedupe_key"]] = row["id"]
+    return dups
+
+
+def backfill_dedupe(sb) -> None:
+    """One-off: compute dedupe_key / duplicate_of for rows saved before this feature existed."""
+    rows: list[dict] = []
+    start = 0
+    while True:
+        chunk = (
+            sb.table("jobs")
+            .select("id,company_name,ai_role,ai_city,original_title,dedupe_key,duplicate_of")
+            .order("scraped_at")
+            .order("id")
+            .range(start, start + 999)
+            .execute()
+            .data
+        )
+        rows += chunk
+        if len(chunk) < 1000:
+            break
+        start += 1000
+    canonical: dict[str, str] = {}
+    dups = updated = 0
+    for r in rows:  # oldest first => oldest row is the canonical one
+        key = make_dedupe_key(r["company_name"], r["ai_role"] or r["original_title"], r["ai_city"])
+        owner = canonical.setdefault(key, r["id"])
+        dup_of = None if owner == r["id"] else owner
+        if r.get("dedupe_key") != key or r.get("duplicate_of") != dup_of:
+            sb.table("jobs").update({"dedupe_key": key, "duplicate_of": dup_of}).eq("id", r["id"]).execute()
+            updated += 1
+        dups += dup_of is not None
+    log.info("backfill: %d rows checked, %d updated, %d duplicates found, %d unique jobs", len(rows), updated, dups, len(rows) - dups)
+
+
+def save_run_log(sb, stats: dict) -> None:
+    """Best-effort: a logging failure must never fail the pipeline."""
+    try:
+        sb.table("pipeline_runs").insert(stats).execute()
+    except Exception as exc:
+        log.warning("could not write pipeline_runs row (run the migration?): %s", exc)
+
+
+# --------------------------------------------------------------------------- #
 # Gemini tagging (batched, multi-model, quota-aware)
 # --------------------------------------------------------------------------- #
 PROMPT = """You are tagging entry-level tech job listings in India for a job board.
@@ -390,9 +521,13 @@ def _call_model(client, model: str, prompt: str) -> str:
 
     config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
     for attempt in range(len(SERVER_RETRY_WAITS) + 1):
+        USAGE.requests += 1
         try:
-            return client.models.generate_content(model=model, contents=prompt, config=config).text
+            resp = client.models.generate_content(model=model, contents=prompt, config=config)
+            record_usage(model, resp)
+            return resp.text
         except Exception as exc:
+            USAGE.failed_requests += 1
             code = _error_code(exc)
             if code in (500, 502, 503, 504) and attempt < len(SERVER_RETRY_WAITS):
                 wait = SERVER_RETRY_WAITS[attempt]
@@ -509,6 +644,9 @@ def run(dry_run: bool, only: list[str] | None) -> int:
     fresh = fresh[:MAX_NEW_JOBS_PER_RUN]
 
     saved_total = 0
+    dup_total = 0
+    seen_keys: dict[str, str] = {}
+    n_new = len(fresh)
     dry_rows: list[dict] = []
     if fresh:
         client = make_gemini()
@@ -525,6 +663,7 @@ def run(dry_run: bool, only: list[str] | None) -> int:
                 )
                 break
             rows = [to_row(batch[i], tags) for i, tags in tagged.items()]
+            dup_total += assign_dedupe(sb, rows, seen_keys)
             # Save after EVERY batch so a later failure never loses finished work.
             if rows:
                 if dry_run:
@@ -532,15 +671,27 @@ def run(dry_run: bool, only: list[str] | None) -> int:
                 else:
                     sb.table("jobs").upsert(rows, on_conflict="source_url").execute()
                 saved_total += len(rows)
-            log.info("[batch %d/%d] saved %d (total %d)", n, len(batches), len(rows), saved_total)
+            log.info("[batch %d/%d] saved %d (total %d, duplicates so far %d)", n, len(batches), len(rows), saved_total, dup_total)
             if n < len(batches):
                 time.sleep(GEMINI_DELAY_SECONDS)
+
+    log.info(
+        "usage: %d requests (%d failed) | tokens in=%d out=%d thinking=%d | tagged=%d duplicates=%d",
+        USAGE.requests, USAGE.failed_requests, USAGE.input_tokens, USAGE.output_tokens, USAGE.thinking_tokens,
+        saved_total, dup_total,
+    )
 
     if dry_run:
         print(json.dumps(dry_rows, indent=2, ensure_ascii=False))
         return 0
 
-    log.info("upserted %d jobs this run", saved_total)
+    log.info("upserted %d jobs this run (%d flagged as cross-portal duplicates)", saved_total, dup_total)
+    save_run_log(sb, {
+        "scraped": len(scraped), "new_jobs": n_new, "tagged": saved_total, "duplicates": dup_total,
+        "requests": USAGE.requests, "failed_requests": USAGE.failed_requests,
+        "input_tokens": USAGE.input_tokens, "output_tokens": USAGE.output_tokens,
+        "thinking_tokens": USAGE.thinking_tokens, "by_model": USAGE.by_model,
+    })
     log.info("purged %d jobs older than %d days", purge_old(sb), RETENTION_DAYS)
     return 0
 
@@ -549,8 +700,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="don't write to Supabase")
     parser.add_argument("--only", help="comma-separated sources, e.g. internshala,unstop")
+    parser.add_argument("--backfill-dedupe", action="store_true", help="flag cross-portal duplicates among existing rows, then exit")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.backfill_dedupe:
+        backfill_dedupe(get_supabase())
+        return 0
     only = [s.strip().lower() for s in args.only.split(",")] if args.only else None
     return run(args.dry_run, only)
 
