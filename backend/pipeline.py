@@ -519,7 +519,10 @@ def _call_model(client, model: str, prompt: str) -> str:
     """One model, with retries for transient server errors. Raises on 429/4xx so the caller can fall back."""
     from google.genai import types
 
-    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
+    extra = {}
+    if "2.5" in model and "pro" not in model:
+        extra["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1, **extra)  
     for attempt in range(len(SERVER_RETRY_WAITS) + 1):
         USAGE.requests += 1
         try:

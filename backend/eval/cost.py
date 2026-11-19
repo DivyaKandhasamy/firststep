@@ -1,8 +1,12 @@
 """
 Cost per 1,000 posts, from the token counts the pipeline logged to the `pipeline_runs` table.
 
-  python eval/cost.py --in-price 0.30 --out-price 2.50          # USD per 1M tokens, from Google's pricing page
-  python eval/cost.py --in-price 0.30 --out-price 2.50 --since 2026-11-19 --usd-inr 88
+  python eval/cost.py --price gemini-3.8-flash=IN,OUT --price gemini-2.5-flash=IN,OUT
+  python eval/cost.py --price gemini-3.8-flash=IN,OUT --price gemini-2.5-flash=IN,OUT --since 2026-11-19 --usd-inr 88
+
+IN / OUT are USD per 1M tokens for that model. Each model is priced separately from the per-model token
+counts the pipeline logged, so a run that used a fallback model is costed correctly (a blended number).
+Old single-price mode still works: --in-price X --out-price Y (all tokens priced the same).
 
 Prices are arguments because they change: copy them from the official Gemini API pricing page for the
 model you used (paid tier). The free tier costs $0, so this reports the paid-tier equivalent.
@@ -22,6 +26,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def aggregate(rows: list[dict]) -> dict:
+    tot = {k: sum((r.get(k) or 0) for r in rows) for k in
+           ("tagged", "duplicates", "requests", "failed_requests", "input_tokens", "output_tokens", "thinking_tokens")}
+    tot["runs"] = len(rows)
+    models: dict[str, dict] = {}
+    for r in rows:
+        for name, m in (r.get("by_model") or {}).items():
+            a = models.setdefault(name, {"requests": 0, "input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0})
+            for k in a:
+                a[k] += int(m.get(k) or 0)
+    tot["by_model"] = models
+    return tot
+
+
+def parse_prices(items: list[str]) -> dict[str, tuple[float, float]]:
+    prices = {}
+    for it in items or []:
+        try:
+            name, pair = it.split("=")
+            pin, pout = pair.split(",")
+            prices[name.strip()] = (float(pin), float(pout))
+        except ValueError:
+            sys.exit(f"Bad --price '{it}'. Use MODEL=IN,OUT  e.g. gemini-3.8-flash=0.30,2.50")
+    return prices
+
+
 def load_totals(since: str | None) -> dict:
     from supabase import create_client
 
@@ -34,16 +64,14 @@ def load_totals(since: str | None) -> dict:
     rows = q.execute().data
     if not rows:
         sys.exit("No pipeline_runs rows found (did you run the migration and a real, non-dry run?).")
-    tot = {k: sum((r.get(k) or 0) for r in rows) for k in
-           ("tagged", "duplicates", "requests", "failed_requests", "input_tokens", "output_tokens", "thinking_tokens")}
-    tot["runs"] = len(rows)
-    return tot
+    return aggregate(rows)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--in-price", type=float, required=True, help="USD per 1M input tokens")
-    ap.add_argument("--out-price", type=float, required=True, help="USD per 1M output tokens (thinking included)")
+    ap.add_argument("--price", action="append", help="MODEL=IN,OUT (USD per 1M tokens); repeat for each model used")
+    ap.add_argument("--in-price", type=float, help="single-price mode: USD per 1M input tokens")
+    ap.add_argument("--out-price", type=float, help="single-price mode: USD per 1M output tokens (thinking included)")
     ap.add_argument("--since", help="only runs on/after this date, e.g. 2026-11-19")
     ap.add_argument("--usd-inr", type=float, help="optional exchange rate to also print INR")
     ap.add_argument("--jobs", type=int); ap.add_argument("--in-tokens", type=int); ap.add_argument("--out-tokens", type=int)
@@ -59,13 +87,35 @@ def main() -> None:
     if not posts:
         sys.exit("0 tagged posts in the selected runs, nothing to divide by.")
     out_tokens = t["output_tokens"] + t["thinking_tokens"]
-    cost = t["input_tokens"] / 1e6 * args.in_price + out_tokens / 1e6 * args.out_price
+
+    prices = parse_prices(args.price)
+    lines = []
+    if prices and t.get("by_model"):
+        missing = sorted(set(t["by_model"]) - set(prices))
+        if missing:
+            sys.exit(f"Missing --price for model(s): {', '.join(missing)}  (used in these runs)")
+        cost = 0.0
+        for name, m in sorted(t["by_model"].items()):
+            pin, pout = prices[name]
+            billable_out = m["output_tokens"] + m["thinking_tokens"]
+            c = m["input_tokens"] / 1e6 * pin + billable_out / 1e6 * pout
+            cost += c
+            think_share = m["thinking_tokens"] / billable_out * 100 if billable_out else 0
+            lines.append(f"  {name}: {m['requests']} ok requests, in={m['input_tokens']:,} out={m['output_tokens']:,} "
+                         f"thinking={m['thinking_tokens']:,} ({think_share:.0f}% of its output bill) -> ${c:.4f}")
+    elif args.in_price is not None and args.out_price is not None:
+        cost = t["input_tokens"] / 1e6 * args.in_price + out_tokens / 1e6 * args.out_price
+    else:
+        sys.exit("Give --price MODEL=IN,OUT for each model used (or --in-price and --out-price).")
     per_1000 = cost / posts * 1000
 
     print(f"Runs: {t['runs']}   Posts tagged: {posts}   (cross-portal duplicates flagged: {t['duplicates']})")
     print(f"Requests: {t['requests']} ({t['failed_requests']} failed)  ->  {t['requests'] / posts * 1000:.0f} requests per 1,000 posts")
     print(f"Tokens: input {t['input_tokens']:,}  output {t['output_tokens']:,}  thinking {t['thinking_tokens']:,}")
     print(f"Per post: {t['input_tokens'] / posts:.0f} input + {out_tokens / posts:.0f} output tokens")
+    if lines:
+        print("Per model:")
+        print("\n".join(lines))
     print(f"Total cost at these prices: ${cost:.4f}")
     print(f"==> COST PER 1,000 POSTS: ${per_1000:.4f}" + (f"  (~Rs {per_1000 * args.usd_inr:.2f})" if args.usd_inr else ""))
     print("Note: failed requests may still have counted against quota but usually return no billed tokens.")
